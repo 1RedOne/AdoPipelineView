@@ -290,25 +290,31 @@ $('#loadSample').addEventListener('click', ()=>{
   $('#src').value = `extends:
   parameters:
     stages:      
-      - stage: Canary_EastUS2_EUAP
-        displayName: Canary EastUs2 EUAP
+      - stage: Build
+        displayName: Build
+        jobs: [ { job: PSbuild.ps1} ]
+      - stage: Canary
+        dependsOn: Build
         jobs: [ { job: Deploy } ]
-      - stage: WUS2
-        dependsOn: Canary_EastUS2_EUAP
+      - stage: EAP2
+        displayName: "User Early Access - East Us 2"
+        dependsOn: Build
         jobs: [ { job: Deploy } ]
-      - stage: WEU
-        dependsOn: WUS2
+      - stage: BakeTime
+        displayName: "24 hour scream test"
+        dependsOn: EAP2
         jobs: [ { job: Deploy } ]
-      - stage: SEA
-        dependsOn: WEU
+      - stage: GeneralRollOutPhase
+        displayName: "General Roll out"
+        dependsOn: BakeTime
         jobs: [ { job: Deploy } ]
-      - stage: AC
-        dependsOn: WEU
+      - stage: ProdEast
+        dependsOn: GeneralRollOutPhase
         jobs: [ { job: Deploy } ]
-      - stage: Prod_ASE
-        displayName: "Prod: WEU"
-        dependsOn: WEU
+      - stage: PRodWest
+        dependsOn: GeneralRollOutPhase
         jobs: [ { job: Deploy } ]
+
 
 `;
   setStatus('ok','Sample loaded. Click Render.');
@@ -341,4 +347,5 @@ $('#loadSample').click();
 </script>
 </body>
 </html>
+
 
