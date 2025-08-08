@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Preview ADO Pipeline (Konva – Toggle + Orphan Box + Scroll)</title>
+<style>
+  :root{--bg:#0b1020;--card:#121a33;--muted:#9fb1ff;--line:#6b7cff}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Inter,ui-sans-serif,Segoe UI,Roboto,Arial;background:linear-gradient(135deg,#0b1020,#101a38);color:#dce3ff}
+  header{padding:12px 18px;display:flex;gap:10px;align-items:center;border-bottom:1px solid #1c2647;flex-wrap:wrap}
+  h1{font-size:16px;margin:0 8px 0 0}
+  .btn{background:#1a2450;border:1px solid #2b3a78;color:#dce3ff;padding:8px 12px;border-radius:10px;cursor:pointer}
+  .btn:hover{filter:brightness(1.08)}
+  input[type="text"]{min-width:320px;background:#0f1733;color:#dce3ff;border:1px solid #2b3a78;border-radius:10px;padding:8px 10px}
+  textarea{width:100%;height:160px;background:#0f1733;color:#dce3ff;border:1px solid #2b3a78;border-radius:12px;padding:10px;font-family:ui-monospace,Consolas,Menlo,monospace}
+  #status{min-height:18px;margin-left:8px}
+  .ok{color:#9ff3b7}.warn{color:#ffd27d}.err{color:#ff9b9b}
+  /* scrollable drawing area */
+  #container{width:100%;height:70vh;overflow:auto;background:transparent}
+  .seg{display:inline-flex;border:1px solid #2b3a78;border-radius:10px;overflow:hidden}
+  .seg button{border:0;background:#0f1733;color:#dce3ff;padding:6px 10px;cursor:pointer}
+  .seg button.active{background:#1a2450}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/konva@9.3.13/konva.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>Preview ADO Pipeline (Konva)</h1>
+  <input type="file" id="file" accept=".yml,.yaml"/>
+  <input id="url" type="text" placeholder="https://raw.githubusercontent.com/.../pipeline.yml"/>
+  <button class="btn" id="loadUrl">Load URL</button>
+  <button class="btn" id="loadSample">Load sample</button>
+  <button class="btn" id="render">Render</button>
+
+  <!-- Orientation toggle -->
+  <div class="seg" id="orientSeg">
+    <button id="btnH" class="active" title="Left → Right">Horizontal</button>
+    <button id="btnV" title="Top → Bottom">Vertical</button>
+  </div>
+
+  <span id="status"></span>
+</header>
+
+<section style="padding:10px 18px">
+  <textarea id="src" placeholder="Paste your Azure Pipelines YAML here… (drag & drop a .yml file anywhere)"></textarea>
+</section>
+
+<div id="container"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const statusEl = $('#status');
+function setStatus(kind, msg){ statusEl.className=kind; statusEl.textContent=msg; }
+
+// ---------- YAML parse
+function normalizeDepends(dep){ if(dep==null) return []; return Array.isArray(dep)?dep.filter(Boolean).map(String):[String(dep)]; }
+function pickStagesRoot(doc){
+  if (Array.isArray(doc?.stages)) return {node:doc.stages, where:'stages'};
+  if (Array.isArray(doc?.extends?.parameters?.stages)) return {node:doc.extends.parameters.stages, where:'extends.parameters.stages'};
+  if (Array.isArray(doc?.parameters?.stages)) return {node:doc.parameters.stages, where:'parameters.stages'};
+  return null;
+}
+function parseYaml(text){
+  let doc;
+  try{ doc = jsyaml.load(text); }
+  catch(e){ const where=e?.mark?` at ${e.mark.line+1}:${e.mark.column+1}`:''; throw new Error(`YAML parse failed${where} — ${e.reason||e.message}`); }
+  const picked = pickStagesRoot(doc);
+  if(!picked) throw new Error('No stages found. Looked for `stages`, `extends.parameters.stages`, `parameters.stages`.');
+
+  const stages = picked.node.map(s=>{
+    const name = s.stage || s.name || 'UnnamedStage';
+    return { name, label: s.displayName || name, depends: normalizeDepends(s.dependsOn), jobs: (s.jobs||[]).map(j=>j.job||j.name||'job') };
+  });
+
+  const names=new Set(), dup=[], bad=[];
+  stages.forEach(s=>names.has(s.name)?dup.push(s.name):names.add(s.name));
+  stages.forEach(s=>s.depends.forEach(d=>{ if(!names.has(d)) bad.push(`${s.name}→${d}`); }));
+  if(dup.length||bad.length) setStatus('warn', `Parsed ${stages.length} with warnings: ${dup.length?`dupes: ${dup.join(', ')} `:''}${bad.length?`bad deps: ${bad.join(' | ')}`:''}`);
+  else setStatus('ok', `Parsed ${stages.length} stages.`);
+  return stages;
+}
+
+// ---------- Graph helpers
+function indegOutdeg(stages){
+  const indeg = Object.fromEntries(stages.map(s=>[s.name,0]));
+  const outdeg= Object.fromEntries(stages.map(s=>[s.name,0]));
+  stages.forEach(s=>{ s.depends.forEach(d=>{ indeg[s.name]++; outdeg[d]++; }); });
+  return {indeg,outdeg};
+}
+function splitOrphans(stages){
+  const {indeg,outdeg} = indegOutdeg(stages);
+  const orphans = stages.filter(s => indeg[s.name]===0 && outdeg[s.name]===0);
+  const core = stages.filter(s => !(indeg[s.name]===0 && outdeg[s.name]===0));
+  return {core, orphans};
+}
+function topo(stages){
+  const map=Object.fromEntries(stages.map(s=>[s.name,s])); const indeg={};
+  stages.forEach(s=>indeg[s.name]=0); stages.forEach(s=>s.depends.forEach(d=>indeg[s.name]++));
+  const levels=[], used=new Set(); let frontier=Object.keys(indeg).filter(k=>indeg[k]===0);
+  if(frontier.length===0 && stages.length) frontier=[stages[0].name];
+  while(frontier.length){
+    levels.push([...frontier]); frontier.forEach(n=>used.add(n));
+    const next=[]; stages.forEach(s=>{ if(!used.has(s.name) && s.depends.every(d=>used.has(d))) next.push(s.name); });
+    frontier = next;
+  }
+  stages.forEach(s=>{ if(!levels.flat().includes(s.name)) (levels[levels.length-1]||levels.push([])).push(s.name); });
+  return levels.map(l=>l.map(n=>map[n]));
+}
+
+// ---------- Konva rendering
+let stage, nodesLayer, arrowsLayer, orphanLayer, lastStages=null;
+let orientation = 'horizontal'; // or 'vertical'
+
+// Stage lives inside #container; we make stage bigger than container to enable scrollbars.
+function initStage(width, height){
+  if(stage){ stage.destroy(); }
+  stage = new Konva.Stage({ container:'container', width, height });
+  arrowsLayer = new Konva.Layer();
+  nodesLayer  = new Konva.Layer();
+  orphanLayer = new Konva.Layer();
+  stage.add(arrowsLayer); stage.add(nodesLayer); stage.add(orphanLayer);
+}
+
+function renderKonva(stages){
+  lastStages = stages;
+
+  const { core, orphans } = splitOrphans(stages);
+  const levels = topo(core);
+
+  // card sizes & gaps
+  const cardW=260, cardH=110;
+  const gapX=80, gapY=40;
+  const margin=40;
+
+  const nodesByName = new Map(), anchors = new Map();
+
+  // Compute positions for core graph
+  const positions = new Map(); // name -> {x,y}
+  if (orientation==='horizontal'){
+    levels.forEach((level, col)=>{
+      level.forEach((s, row)=>{
+        const x = margin + col*(cardW+gapX);
+        const y = margin + row*(cardH+gapY);
+        positions.set(s.name, {x,y});
+      });
+    });
+  } else {
+    levels.forEach((level, row)=>{
+      level.forEach((s, col)=>{
+        const x = margin + col*(cardW+gapX);
+        const y = margin + row*(cardH+gapY);
+        positions.set(s.name, {x,y});
+      });
+    });
+  }
+
+  // Compute orphan box placement (extra column or row)
+  let orphanBox = null;
+  let maxCoreX = 0, maxCoreY = 0;
+  positions.forEach(({x,y})=>{
+    if (x>maxCoreX) maxCoreX=x;
+    if (y>maxCoreY) maxCoreY=y;
+  });
+  const coreWidth  = (positions.size? maxCoreX + cardW + margin : 0);
+  const coreHeight = (positions.size? maxCoreY + cardH + margin : 0);
+
+  const orphanPad = 16;
+  const orphanCols = 3; // simple grid
+  const orphanW = orphans.length ? (orphanCols*cardW + (orphanCols-1)*gapX + orphanPad*2) : 0;
+  const orphanRows = orphans.length ? Math.ceil(orphans.length / orphanCols) : 0;
+  const orphanH = orphans.length ? (orphanRows*cardH + (orphanRows-1)*gapY + orphanPad*2 + 26) : 0; // + title
+
+  let orphanOrigin = {x: margin, y: margin}; // will adjust based on orientation
+  if (orphans.length){
+    if (orientation==='horizontal'){
+      orphanOrigin = { x: coreWidth + gapX, y: margin };
+    } else {
+      orphanOrigin = { x: margin, y: coreHeight + gapY };
+    }
+  }
+
+  // Stage size = bounds of core + orphan area
+  const stageWidth  = Math.max(coreWidth,  orphanOrigin.x + orphanW + margin, 800);
+  const stageHeight = Math.max(coreHeight, orphanOrigin.y + orphanH + margin, 500);
+  initStage(stageWidth, stageHeight);
+
+  // Draw core nodes
+  core.forEach(s=>{
+    const {x,y} = positions.get(s.name);
+    const g = new Konva.Group({ x, y, draggable:true, id:s.name });
+    const rect = new Konva.Rect({ width:cardW, height:cardH, cornerRadius:16, fill:'#121a33', stroke:'#233064', strokeWidth:1.2, shadowBlur:12, shadowColor:'black' });
+    const title = new Konva.Text({ x:14, y:12, text:s.label, fontSize:16, fontStyle:'700', fill:'#dce3ff' });
+    const meta  = new Konva.Text({ x:14, y:40, text:`${s.jobs.length} jobs   deps: ${s.depends.length}`, fontSize:12, fill:'#9fb1ff' });
+    g.add(rect, title, meta);
+    nodesLayer.add(g);
+    nodesByName.set(s.name, g);
+
+    if(orientation==='horizontal'){
+      anchors.set(s.name, {
+        entry: () => ({ x: g.x(),          y: g.y()+cardH/2 }),      // left
+        exit:  () => ({ x: g.x()+cardW,    y: g.y()+cardH/2 })       // right
+      });
+    } else {
+      anchors.set(s.name, {
+        entry: () => ({ x: g.x()+cardW/2,  y: g.y() }),              // top
+        exit:  () => ({ x: g.x()+cardW/2,  y: g.y()+cardH })         // bottom
+      });
+    }
+
+    g.on('dragmove', ()=> updateArrows(core, anchors));
+  });
+
+  // Draw orphan box + orphan nodes
+  if (orphans.length){
+    const box = new Konva.Rect({
+      x: orphanOrigin.x, y: orphanOrigin.y,
+      width: orphanW, height: orphanH,
+      stroke: '#2c3a77', dash: [6,4], cornerRadius: 12, strokeWidth: 1.5,
+      fill: 'rgba(18,26,51,0.35)'
+    });
+    const title = new Konva.Text({
+      x: orphanOrigin.x + orphanPad, y: orphanOrigin.y + 6,
+      text: 'Orphaned Regions', fontSize: 14, fill: '#9fb1ff', fontStyle: '700'
+    });
+    orphanLayer.add(box); orphanLayer.add(title);
+
+    // place orphan cards inside grid
+    orphans.forEach((s, i)=>{
+      const col = i % orphanCols;
+      const row = Math.floor(i / orphanCols);
+      const x = orphanOrigin.x + orphanPad + col*(cardW+gapX);
+      const y = orphanOrigin.y + orphanPad + 26 + row*(cardH+gapY); // +title bar
+      const g = new Konva.Group({ x, y, draggable:true, id:s.name });
+      const rect = new Konva.Rect({ width:cardW, height:cardH, cornerRadius:16, fill:'#121a33', stroke:'#233064', strokeWidth:1.2, shadowBlur:12, shadowColor:'black' });
+      const t   = new Konva.Text({ x:14, y:12, text:s.label, fontSize:16, fontStyle:'700', fill:'#dce3ff' });
+      const m   = new Konva.Text({ x:14, y:40, text:`${s.jobs.length} jobs   deps: ${s.depends.length}`, fontSize:12, fill:'#9fb1ff' });
+      g.add(rect,t,m);
+      orphanLayer.add(g);
+      // note: orphan nodes have no edges, so no anchors/arrows needed
+    });
+  }
+
+  function updateArrows(nodes, anchors){
+    arrowsLayer.destroyChildren();
+    const stroke = getComputedStyle(document.documentElement).getPropertyValue('--line') || '#6b7cff';
+    nodes.forEach(s=>{
+      const end = anchors.get(s.name)?.entry?.();
+      s.depends.forEach(d=>{
+        const start = anchors.get(d)?.exit?.();
+        if(!start || !end) return;
+        let points;
+        if(orientation==='horizontal'){
+          const midX = (start.x + end.x)/2;
+          points = [ start.x, start.y,  midX, start.y,  midX, end.y,  end.x, end.y ]; // H → V → H
+        } else {
+          const midY = (start.y + end.y)/2;
+          points = [ start.x, start.y,  start.x, midY,  end.x, midY,  end.x, end.y ]; // V → H → V
+        }
+        const arrow = new Konva.Arrow({
+          points, stroke, fill: stroke, strokeWidth: 2.5,
+          pointerLength: 10, pointerWidth: 10, lineCap:'round', lineJoin:'round'
+        });
+        arrowsLayer.add(arrow);
+      });
+    });
+    arrowsLayer.batchDraw();
+  }
+
+  updateArrows(core, anchors);
+  nodesLayer.draw(); orphanLayer.draw();
+}
+
+// ---------- UI wiring
+$('#file').addEventListener('change', async e=>{
+  const f = e.target.files[0]; if(!f) return;
+  $('#src').value = await f.text();
+  setStatus('ok', `Loaded ${f.name}. Click Render.`);
+});
+$('#loadUrl').addEventListener('click', async ()=>{
+  const url = $('#url').value.trim(); if(!url) return alert('Enter a URL');
+  try{
+    const res=await fetch(url); if(!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    $('#src').value = await res.text();
+    setStatus('ok','Fetched YAML. Click Render.');
+  }catch(err){ setStatus('err','Fetch failed: '+err.message+' (CORS?)'); }
+});
+$('#loadSample').addEventListener('click', ()=>{
+  $('#src').value = `extends:
+  parameters:
+    stages:      
+      - stage: Canary_EastUS2_EUAP
+        displayName: Canary EastUs2 EUAP
+        jobs: [ { job: Deploy } ]
+      - stage: WUS2
+        dependsOn: Canary_EastUS2_EUAP
+        jobs: [ { job: Deploy } ]
+      - stage: WEU
+        dependsOn: WUS2
+        jobs: [ { job: Deploy } ]
+      - stage: SEA
+        dependsOn: WEU
+        jobs: [ { job: Deploy } ]
+      - stage: AC
+        dependsOn: WEU
+        jobs: [ { job: Deploy } ]
+      - stage: Prod_ASE
+        displayName: "Prod: WEU"
+        dependsOn: WEU
+        jobs: [ { job: Deploy } ]
+
+`;
+  setStatus('ok','Sample loaded. Click Render.');
+});
+$('#render').addEventListener('click', ()=>{
+  try{ renderKonva(parseYaml($('#src').value)); }catch(err){ setStatus('err', err.message); }
+});
+// Drag & drop
+window.addEventListener('dragover', e=>e.preventDefault());
+window.addEventListener('drop', async e=>{
+  e.preventDefault();
+  const f = e.dataTransfer?.items?.[0]?.getAsFile?.() || e.dataTransfer?.files?.[0];
+  if(f){ $('#src').value = await f.text(); setStatus('ok', `Loaded ${f.name}. Click Render.`); }
+});
+
+// Orientation toggle
+$('#btnH').addEventListener('click', ()=>{
+  orientation='horizontal';
+  $('#btnH').classList.add('active'); $('#btnV').classList.remove('active');
+  if(lastStages) renderKonva(lastStages);
+});
+$('#btnV').addEventListener('click', ()=>{
+  orientation='vertical';
+  $('#btnV').classList.add('active'); $('#btnH').classList.remove('active');
+  if(lastStages) renderKonva(lastStages);
+});
+
+// Boot with sample
+$('#loadSample').click();
+</script>
+</body>
+</html>
