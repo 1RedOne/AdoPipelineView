@@ -21,11 +21,16 @@
   .seg{display:inline-flex;border:1px solid #2b3a78;border-radius:10px;overflow:hidden}
   .seg button{border:0;background:#0f1733;color:#dce3ff;padding:6px 10px;cursor:pointer}
   .seg button.active{background:#1a2450}
+      .foxdeploy-home{position:fixed;top:20px;left:20px;width:60px;height:60px;background:#f1c40f;border-radius:50%;box-shadow:0 6px 10px 0 rgba(0,0,0,0.3);transition:all 0.2s ease-in-out;z-index:1000;display:flex;align-items:center;justify-content:center;text-decoration:none;border:2px solid #e67e22}
+    .foxdeploy-home:hover{box-shadow:0 6px 14px 0 rgba(241,196,15,0.6);transform:scale(1.1);text-decoration:none}
+    .foxdeploy-home::before{content:'';font-size:28px;line-height:1}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/konva@9.3.13/konva.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
 </head>
 <body>
+    <a href="https://www.foxdeploy.com" class="foxdeploy-home" title="Return to FoxDeploy.com" target="_blank"> <img src="http://www.foxdeploy.com/assets/images/bernieButtonSmoll.png" alt="Depicts a cute golden doodle illustration."></a>
+
 <header>
   <h1>Preview ADO Pipeline (Konva)</h1>
   <input type="file" id="file" accept=".yml,.yaml"/>
@@ -347,5 +352,6 @@ $('#loadSample').click();
 </script>
 </body>
 </html>
+
 
 
