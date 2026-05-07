@@ -110,7 +110,8 @@ function topo(stages){
     const next=[]; stages.forEach(s=>{ if(!used.has(s.name) && s.depends.every(d=>used.has(d))) next.push(s.name); });
     frontier = next;
   }
-  stages.forEach(s=>{ if(!levels.flat().includes(s.name)) (levels[levels.length-1]||levels.push([])).push(s.name); });
+  // Any nodes still not used are cycle-involved or disconnected from the computed frontier.
+  stages.forEach(s=>{ if(!used.has(s.name)) (levels[levels.length-1]||levels.push([])).push(s.name); });
   return levels.map(l=>l.map(n=>map[n]));
 }
 
@@ -122,7 +123,7 @@ let orientation = 'horizontal'; // or 'vertical'
 function initStage(width, height){
   if(stage){ stage.destroy(); }
   stage = new Konva.Stage({ container:'container', width, height });
-  arrowsLayer = new Konva.Layer();
+  arrowsLayer = new Konva.FastLayer({ listening:false });
   nodesLayer  = new Konva.Layer();
   orphanLayer = new Konva.Layer();
   stage.add(arrowsLayer); stage.add(nodesLayer); stage.add(orphanLayer);
@@ -195,7 +196,17 @@ function renderKonva(stages){
   core.forEach(s=>{
     const {x,y} = positions.get(s.name);
     const g = new Konva.Group({ x, y, draggable:true, id:s.name });
-    const rect = new Konva.Rect({ width:cardW, height:cardH, cornerRadius:16, fill:'#121a33', stroke:'#233064', strokeWidth:1.2, shadowBlur:12, shadowColor:'black' });
+    const rect = new Konva.Rect({
+      width:cardW,
+      height:cardH,
+      cornerRadius:16,
+      fill:'#121a33',
+      stroke:'#233064',
+      strokeWidth:1.2,
+      // Shadows are expensive on large scenes; keeping this flat improves FPS noticeably.
+      shadowBlur:0,
+      listening:false
+    });
     const title = new Konva.Text({ x:14, y:12, text:s.label, fontSize:16, fontStyle:'700', fill:'#dce3ff' });
     const meta  = new Konva.Text({ x:14, y:40, text:`${s.jobs.length} jobs   deps: ${s.depends.length}`, fontSize:12, fill:'#9fb1ff' });
     g.add(rect, title, meta);
@@ -214,7 +225,6 @@ function renderKonva(stages){
       });
     }
 
-    g.on('dragmove', ()=> updateArrows(core, anchors));
   });
 
   // Draw orphan box + orphan nodes
@@ -238,7 +248,16 @@ function renderKonva(stages){
       const x = orphanOrigin.x + orphanPad + col*(cardW+gapX);
       const y = orphanOrigin.y + orphanPad + 26 + row*(cardH+gapY); // +title bar
       const g = new Konva.Group({ x, y, draggable:true, id:s.name });
-      const rect = new Konva.Rect({ width:cardW, height:cardH, cornerRadius:16, fill:'#121a33', stroke:'#233064', strokeWidth:1.2, shadowBlur:12, shadowColor:'black' });
+      const rect = new Konva.Rect({
+        width:cardW,
+        height:cardH,
+        cornerRadius:16,
+        fill:'#121a33',
+        stroke:'#233064',
+        strokeWidth:1.2,
+        shadowBlur:0,
+        listening:false
+      });
       const t   = new Konva.Text({ x:14, y:12, text:s.label, fontSize:16, fontStyle:'700', fill:'#dce3ff' });
       const m   = new Konva.Text({ x:14, y:40, text:`${s.jobs.length} jobs   deps: ${s.depends.length}`, fontSize:12, fill:'#9fb1ff' });
       g.add(rect,t,m);
@@ -247,33 +266,80 @@ function renderKonva(stages){
     });
   }
 
-  function updateArrows(nodes, anchors){
-    arrowsLayer.destroyChildren();
-    const stroke = getComputedStyle(document.documentElement).getPropertyValue('--line') || '#6b7cff';
-    nodes.forEach(s=>{
-      const end = anchors.get(s.name)?.entry?.();
-      s.depends.forEach(d=>{
-        const start = anchors.get(d)?.exit?.();
-        if(!start || !end) return;
-        let points;
-        if(orientation==='horizontal'){
-          const midX = (start.x + end.x)/2;
-          points = [ start.x, start.y,  midX, start.y,  midX, end.y,  end.x, end.y ]; // H → V → H
-        } else {
-          const midY = (start.y + end.y)/2;
-          points = [ start.x, start.y,  start.x, midY,  end.x, midY,  end.x, end.y ]; // V → H → V
-        }
-        const arrow = new Konva.Arrow({
-          points, stroke, fill: stroke, strokeWidth: 2.5,
-          pointerLength: 10, pointerWidth: 10, lineCap:'round', lineJoin:'round'
-        });
-        arrowsLayer.add(arrow);
+  // Edge registry for incremental updates: only recompute arrows affected by moved node.
+  const stroke = (getComputedStyle(document.documentElement).getPropertyValue('--line') || '#6b7cff').trim();
+  const edgesByNode = new Map();
+  const edges = [];
+
+  function edgePoints(fromName, toName){
+    const start = anchors.get(fromName)?.exit?.();
+    const end = anchors.get(toName)?.entry?.();
+    if(!start || !end) return null;
+    if(orientation==='horizontal'){
+      const midX = (start.x + end.x)/2;
+      return [ start.x, start.y,  midX, start.y,  midX, end.y,  end.x, end.y ]; // H → V → H
+    }
+    const midY = (start.y + end.y)/2;
+    return [ start.x, start.y,  start.x, midY,  end.x, midY,  end.x, end.y ]; // V → H → V
+  }
+
+  function linkEdgeToNode(nodeName, edgeRef){
+    if(!edgesByNode.has(nodeName)) edgesByNode.set(nodeName, []);
+    edgesByNode.get(nodeName).push(edgeRef);
+  }
+
+  core.forEach(s=>{
+    s.depends.forEach(d=>{
+      if(!anchors.has(d) || !anchors.has(s.name)) return;
+      const points = edgePoints(d, s.name);
+      if(!points) return;
+      const arrow = new Konva.Arrow({
+        points,
+        stroke,
+        fill: stroke,
+        strokeWidth: 2.5,
+        pointerLength: 10,
+        pointerWidth: 10,
+        lineCap:'round',
+        lineJoin:'round',
+        listening:false
       });
+      arrowsLayer.add(arrow);
+      const edgeRef = { from:d, to:s.name, arrow };
+      edges.push(edgeRef);
+      linkEdgeToNode(d, edgeRef);
+      linkEdgeToNode(s.name, edgeRef);
+    });
+  });
+
+  let dragRaf = 0;
+  const dirtyNodes = new Set();
+  function flushEdgeUpdates(){
+    dragRaf = 0;
+    const touched = new Set();
+    dirtyNodes.forEach(name=>{
+      const nodeEdges = edgesByNode.get(name) || [];
+      nodeEdges.forEach(e=>touched.add(e));
+    });
+    dirtyNodes.clear();
+
+    touched.forEach(e=>{
+      const pts = edgePoints(e.from, e.to);
+      if(pts) e.arrow.points(pts);
     });
     arrowsLayer.batchDraw();
   }
+  function scheduleEdgeUpdate(nodeName){
+    dirtyNodes.add(nodeName);
+    if(!dragRaf) dragRaf = requestAnimationFrame(flushEdgeUpdates);
+  }
 
-  updateArrows(core, anchors);
+  core.forEach(s=>{
+    const g = nodesByName.get(s.name);
+    if(g) g.on('dragmove', ()=> scheduleEdgeUpdate(s.name));
+  });
+
+  arrowsLayer.batchDraw();
   nodesLayer.draw(); orphanLayer.draw();
 }
 
@@ -352,6 +418,5 @@ $('#loadSample').click();
 </script>
 </body>
 </html>
-
 
 
